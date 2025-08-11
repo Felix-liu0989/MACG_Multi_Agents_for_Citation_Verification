@@ -1,0 +1,33 @@
+# 环境配置文件
+.env
+*.env
+
+# Python编译文件
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# PDF文件（论文等）
+*.pdf
+
+# 内部数据文件
+internal_collection.json
+
+# Jupyter Notebook检查点
+.ipynb_checkpoints/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# 临时文件
+*.tmp
+*.temp
+
+# 蛋文件
+*.egg-info/
+dist/
+build/ 
