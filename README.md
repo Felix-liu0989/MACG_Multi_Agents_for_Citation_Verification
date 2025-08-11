@@ -35,7 +35,7 @@ MILVUS_TOKEN=citegeist:citegeist
 
 1. **Activate Environment**
    ```bash
-   conda activate taxo
+   conda activate MACG
    ```
 
 2. **Basic Usage**
