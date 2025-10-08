@@ -1,17 +1,50 @@
 import json_repair
-from evaluation.agents.judge import Judge
+from agents.prompts import CRITICAL_EVALUATION_PROMPT_Two_Related_Works_Compared_CRITERIA
+from agents.judge import Judge
 from citegeist.utils.infer import jsonl2json
 import json,jsonlines
 
 from citegeist.utils.infer import load_processed_ids
 from tqdm import tqdm
 import os
-print(os.getenv("OPENAI_API_KEY"))
 import dotenv
 dotenv.load_dotenv()
 judge = Judge(
-    model = "openai/o3-mini"
+    model = "openai/gpt-5-nano"
 )
+
+def process_with_checkpoint_eval_for_two_related_works_compared_criteria(input_file1,input_file2):
+    with open(input_file1,"r",encoding="utf-8") as f:
+        data = json.load(f)
+    with open(input_file2,"r",encoding="utf-8") as f:
+        data2 = json.load(f)
+    abstracts = [item["abstract"] for item in data]
+    related_works1 = [item["related_work"]["related_works"] for item in data]
+    print(len(related_works1))
+    related_works2 = data2["predictions"]
+    # related_works2 = [item["related_work"]["related_works"] for item in data2[:5]]
+    # related_works2 = [json.dumps(item["related_work"]["original_related_work"],ensure_ascii=False) for item in data2[:5]]
+    print(len(related_works2))
+    print(related_works1[0])
+    print(related_works2[0])
+    results = []
+    winner1 = 0
+    winner2 = 0
+    for abstract, related_work1, related_work2 in zip(abstracts, related_works1, related_works2):
+        result = judge.evaluate_two_related_works_compared(related_work2, related_work1, abstract,CRITICAL_EVALUATION_PROMPT_Two_Related_Works_Compared_CRITERIA)
+        result = json_repair.loads(result)
+        print(result)
+        results.append(result)
+        if result["winner"] == "work1":
+            winner1 += 1
+        else:
+            winner2 += 1
+    with open(input_file1.replace(".json","_two_related_works_compared_1.json"),"w",encoding="utf-8") as f:
+        json.dump(results,f,ensure_ascii=False,indent=4)
+        print("-"*100)
+    print(f"winner1: {winner1}")
+    print(f"winner2: {winner2}")
+        
 
 def process_simple_eval(abstract,related_work):
     result = judge.evaluate_language(related_work, abstract)
@@ -20,6 +53,54 @@ def process_simple_eval(abstract,related_work):
     criterion = ["Structure", "Relevance","Coverage"]
     scores = judge.batch_criteria_based_judging(related_work, abstract, criterion)
     print(scores)
+    
+def process_with_checkpoint_eval_for_text_quality_litllm(input_file1,input_file2):
+    with open(input_file1,"r",encoding="utf-8") as f:
+        data = json.load(f)
+    with open(input_file2,"r",encoding="utf-8") as f:
+        data2 = json.load(f)
+    abstracts = [item["abstract"] for item in data]
+    related_works = data2["predictions"]
+    
+    clarity = []
+    structure = []
+    relevance = []
+    motivation = []
+    critics = []
+    
+    for abstract, related_work in zip(abstracts, related_works):
+        result = judge.evaluate_text_quality(related_work, abstract)
+        result = result.replace("```json","").replace("```","")
+        result = json_repair.loads(result)
+        result = {
+            "Clarity": result["Clarity"]["score"],
+            "Structure": result["Structure"]["score"],
+            "Relevance": result["Relevance"]["score"],
+            "Motivation": result["Motivation"]["score"],
+            "Critics": result["Critics"]["score"]
+        }
+        clarity.append(result["Clarity"])
+        structure.append(result["Structure"])
+        relevance.append(result["Relevance"])
+        motivation.append(result["Motivation"])
+        critics.append(result["Critics"])
+        print(f"Clarity: {result['Clarity']}")
+        print(f"Structure: {result['Structure']}")
+        print(f"Relevance: {result['Relevance']}")
+        print(f"Motivation: {result['Motivation']}")
+        print(f"Critics: {result['Critics']}")
+        print("-"*100)
+    average_clarity = sum(clarity) / len(clarity)
+    average_structure = sum(structure) / len(structure)
+    average_relevance = sum(relevance) / len(relevance)
+    average_motivation = sum(motivation) / len(motivation)
+    average_critics = sum(critics) / len(critics)
+    print(f"Average clarity: {average_clarity}")
+    print(f"Average structure: {average_structure}")
+    print(f"Average relevance: {average_relevance}")
+    print(f"Average motivation: {average_motivation}")
+    print(f"Average critics: {average_critics}")
+    
     
 def process_with_checkpoint_eval_for_text_quality_baselines(input_file):
     with open(input_file,"r",encoding="utf-8") as f:
@@ -32,7 +113,7 @@ def process_with_checkpoint_eval_for_text_quality_baselines(input_file):
     critics = []
     for item in tqdm(data, desc="Processing items"):
         
-        related_work = item["related_work"]
+        related_work = item["related_work"]["related_works"]
         print(related_work)
         abstract = item["abstract"]
         related_work += "\n" + "## Citations Quality for the related work" + "\n"
@@ -249,10 +330,16 @@ def process_with_checkpoint_eval(input_file, output_file):
         
 def main_MACG():
     process_with_checkpoint_eval_for_text_quality(
-        "/home/liujian/project/2025-07/A2R-code-reproduction/results_our_workflow/citation_eval/result_our_workflow_eval_classify_errors_refine_extract_cited_sentences.json"
+        r"D:\Mydesktop\CitAgent\Code\Supplementary material and code\Multi_Agents_for_Citation_Verification\results\MACG\result_MACG_0_25.json"
     )
     print(f"ourworkflow finished")
 
+def main_litllm():
+    process_with_checkpoint_eval_for_text_quality_litllm(
+        r"D:\Mydesktop\CitAgent\Code\Supplementary material and code\Multi_Agents_for_Citation_Verification\results\litllm\d_0_results\dataset.json",
+        r"D:\Mydesktop\CitAgent\Code\Supplementary material and code\Multi_Agents_for_Citation_Verification\results\litllm\d_0_results\RAG_generated_related_work.json"
+    )
+    print(f"litllm finished")
 
 def main_perplexity():
     process_with_checkpoint_eval_for_text_quality(
@@ -273,7 +360,7 @@ def main_gpt_4o_mini_search():
     print(f"gpt_4o_mini_search finished")
 def main_citegeist():
     process_with_checkpoint_eval_for_text_quality_baselines(
-        "/home/liujian/project/2025-07/A2R-code-reproduction/results_baselines/citegeist/result_citegeist_extract_cited_sentences.json"
+        r"D:\Mydesktop\CitAgent\Code\Supplementary material and code\Multi_Agents_for_Citation_Verification\results\citegeist\result_citegeist_test_1002.json"
     )
     print(f"citegeist finished")
 def main_without_fact_check():
@@ -305,11 +392,18 @@ if __name__ == "__main__":
     # main_naive_rag_gemini()
     # main_without_fact_check()
     # main_without_feedback_revision()
-    # main_MACG()
+    main_MACG()
     # main_perplexity()
     # main_gpt_4o_mini_search()
     # main_with_DAG()
-    main_without_summarization()
+    # main_without_summarization()
+    # main_litllm()
+    # process_with_checkpoint_eval_for_two_related_works_compared_criteria(
+    #     r"D:\Mydesktop\CitAgent\Code\Supplementary material and code\Multi_Agents_for_Citation_Verification\results\result_MACG_fast_20_2_0.json",
+    #     r"D:\Mydesktop\CitAgent\Code\Supplementary material and code\Multi_Agents_for_Citation_Verification\results\litllm\d_0_results\RAG_generated_related_work.json"
+    #     #"D:\Mydesktop\CitAgent\Code\Supplementary material and code\Multi_Agents_for_Citation_Verification\results\citegeist\result_citegeist_test_diversity_0.json"
+    #     #"D:\Mydesktop\CitAgent\Code\Supplementary material and code\Multi_Agents_for_Citation_Verification\eval_set_50.json"
+    # )
 # perplexity_deep_research_eval
 
 # perplexity_deep_research_eval = "/home/liujian/project/2025-07/A2R-code-reproduction/results_baselines/perplexity_deep_research_related_work.jsonl"

@@ -213,7 +213,8 @@ def run_dag_to_classifier(
             
     
     proj_root = Path(__file__).parent.parent.parent
-    out_dir = str(proj_root / f"multi_dim_cls_results/{args.topic.replace(' ', '_')}")
+    
+    out_dir = str(proj_root / f"multi_dim_cls_results/{args.topic.replace(":", "_").replace(' ', '_')}")
     os.makedirs(out_dir, exist_ok=True)
     
     # enricher.enrich_all_dags(args, dags, id2node, save_dir=out_dir)

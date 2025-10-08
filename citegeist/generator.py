@@ -4,6 +4,7 @@ import math
 import os
 import sys
 import re
+import transformers
 sys.path.append(".")
 from evaluation.agents.judge import Judge
 from typing import Callable, Optional
@@ -18,20 +19,21 @@ from multi_dims.paper import Paper
 from multi_dims.visualizer import visualize_dags
 from multi_dims.builder import build_dags, update_roots_with_labels
 from multi_dims.classifier import label_papers_by_topic
-from citegeist.utils.citations import (
+from .utils.citations import (
     filter_citations,
     get_arxiv_abstract,
     get_arxiv_citation,
     get_arxiv_title,
     process_arxiv_paper_with_embeddings,
 )
-from citegeist.utils.filtering import (
+from .utils.filtering import (
     select_diverse_pages_for_top_b_papers,
     select_diverse_papers_with_weighted_similarity,
 )
-from citegeist.utils.llm_clients import create_client
-from citegeist.utils.llm_clients.deepseek_client import DeepSeekClient
-from citegeist.utils.prompts import (
+from .utils.llm_clients import create_client
+from .utils.llm_clients.deepseek_client import DeepSeekClient
+from .utils.llm_clients.deepseek_client_multi_turn import DeepSeekClientMultiTurn
+from .utils.prompts import (
     generate_brief_topic_prompt,
     generate_question_answer_prompt,
     generate_related_work_prompt,
@@ -40,18 +42,28 @@ from citegeist.utils.prompts import (
     generate_related_work_outline_prompt,
     generate_related_work_prompt_with_arxiv_trees,
     generate_related_work_revision_prompt,
-    genrate_original_related_work_feedback_prompt,
+    generate_original_related_work_feedback_prompt,
     generate_related_work_outline_prompt_various_1,
     generate_related_work_revision_prompt_without_DAG,
     generate_summary_prompt_with_second_round_retrieved_content,
     process_data_for_extract_cited_sentences,
     process_data_for_classify_errors,
     process_data_for_correct_citation_errors,
+    generate_related_work_revise_citations_format
 )
 import json_repair
 from pathlib import Path
-
-
+from .utils.agent_context import (
+    AgentCommunicationContext,
+    PaperContext,
+    DAGContext,
+    CitationContext
+)
+from .utils.prompts_enhanced import (
+    generate_enhanced_feedback_prompt,
+    generate_enhanced_revision_prompt
+)
+import time
 # Load environment variables
 load_dotenv()
 
@@ -105,7 +117,7 @@ class Generator:
 
         Args:
             llm_provider: LLM provider name ('azure', 'openai', 'anthropic').
-                          Falls back to environment variable LLM_PROVIDER, then to 'azure'
+                Falls back to environment variable LLM_PROVIDER, then to 'azure'
             sentence_embedding_model_name: Name of the sentence transformer embedding model
             topic_model_name: Name of the BERTopic model
             database_uri: Path to the Milvus database
@@ -125,25 +137,44 @@ class Generator:
 
         # Create LLM client (falls back to value of LLM_PROVIDER in env variables, and finally falls back to azure)
         self.llm_client = create_client(self.llm_provider, **llm_kwargs)
-
+        chat_tokenizer_dir = r"D:\Mydesktop\CitAgent\Code\Supplementary material and code\Multi_Agents_for_Citation_Verification\citegeist\tokenizer"
+        
+        self.tokenizer = transformers.AutoTokenizer.from_pretrained(chat_tokenizer_dir,trust_remote_code=True)
         # Store API version for Azure compatibility
         self.api_version = os.getenv("AZURE_API_VERSION", "2023-05-15")
     def test_args(self):
         args.topic = "natural language processing"
         return args.topic
     
-    def generate_related_work_MACG(
+    def _count_tokens(self,text) -> int:
+        return len(self.tokenizer.encode(text))
+    
+    
+    def generate_related_work_MACG_optimized(
             self,
             abstract: str,
             breadth: int,
             depth: int,
             diversity: float,
+            arxivid: str,
             status_callback: Optional[Callable] = None,
     ):
         if status_callback:
             status_callback(1, "Initializing")
         print("摘要：", abstract)
         print("向量化摘要并在milvus库中检索...")
+        
+        # 创建共享上下文
+        context = AgentCommunicationContext(
+            source_paper_abstract=abstract,
+            arxiv_id=arxiv_id,
+            config={
+                "breadth": breadth, 
+                "depth": depth, 
+                "diversity": diversity
+            }
+        )
+        
         # 向量化摘要并在milvus库中检索  
         embedded_abstract = self.sentence_embedding_model.encode(abstract)
         topic = self.topic_model.transform(abstract)
@@ -201,8 +232,9 @@ class Generator:
             diversity_weight=diversity,
             skip_first=False,
         )
-        with open("relevant_pages.json", "w", encoding="utf-8") as f:
-            json.dump(relevant_pages, f, indent=4, ensure_ascii=False)
+        start_time = time.time()
+        # with open("relevant_pages.json", "w", encoding="utf-8") as f:
+        #     json.dump(relevant_pages, f, indent=4, ensure_ascii=False)
 
         if status_callback:
             status_callback(6, f"Selected {len(relevant_pages)} papers for the shortlist")
@@ -211,6 +243,7 @@ class Generator:
         internal_collection = {}
         data = []
         id = 0
+        start_time_summarization = time.time()
         # Generate summaries for individual papers (taking all relevant pages into account)
         for obj in relevant_pages[1:]:
             # Because paper_id != arXiv_id -> retrieve arXiv id/
@@ -249,14 +282,38 @@ class Generator:
                 "title":title,
                 "abstract":arxiv_abstract,
                 "summary":response,
+                "arxiv_id":arxiv_id,
                 "citations":get_arxiv_citation(arxiv_id)
             }
             selected_papers.append(idx)
+            
+            
+            # 创建PaperContext，保存所有信息
+            paper_ctx = PaperContext(
+                paper_id=id,
+                arxiv_id=arxiv_id,
+                title=title,
+                abstract=arxiv_abstract,
+                summary=response,
+                citation=get_arxiv_citation(arxiv_id),
+                full_text_segments=text_segments,
+                cite_ids=[id]
+            )
+            context.papers.append(paper_ctx)
             id += 1
+            
+            
         # with open("internal_collection.json", "w", encoding="utf-8") as f:
         #     json.dump(data, f, indent=4, ensure_ascii=False)
+        end_time_summarization = time.time()
         
-        with open("selected_papers.json", "w", encoding="utf-8") as f:
+        PROJECT_ROOT = Path(__file__).parent.parent.parent
+        results_dir = PROJECT_ROOT / f"selected_papers/{arxivid.replace('.','_')}"
+        
+
+        # 确保目录存在
+        results_dir.mkdir(exist_ok=True,parents=True)
+        with open(f"{results_dir}/{breadth}_{depth}_{diversity}.json", "w", encoding="utf-8") as f:
             json.dump(selected_papers, f, indent=4, ensure_ascii=False)
         
         # with open("/home/liujian/internal_collection.json", "r", encoding="utf-8") as f:
@@ -264,6 +321,7 @@ class Generator:
         if status_callback:
             status_callback(7, "Generated summaries of papers (and their pages)")
         
+        start_time_DAG = time.time()
         # 生成本篇文章的topic
         topic_prompt = generate_brief_topic_prompt(abstract)
         topic = self.llm_client.get_completion(topic_prompt)
@@ -272,6 +330,7 @@ class Generator:
         
         # 生成文献树
         args.topic = topic
+        
         roots,dags = run_dag_to_classifier(
             args,
             internal_collection
@@ -282,10 +341,268 @@ class Generator:
         proj_root = Path(__file__).parent.parent.parent
         dir = str(proj_root / "multi_dim_literature_visualizations")
         visualizer,arxiv_trees = visualize_dags(roots, dags, output_dir=dir,topic=args.topic)
-        
+
         ## 为生成related work，先生成大纲
         print("正在生成related work大纲...")
         outline_prompt = generate_related_work_outline_prompt_various_1(abstract,arxiv_trees)
+        outline = self.llm_client.get_completion(outline_prompt)
+        outline = json_repair.loads(outline)
+        
+
+        print("outline:")
+        print(outline)
+        
+        subsection_titles = outline["outline"]
+            
+        
+        args.dimensions = subsection_titles
+        roots,dags,id2node,label2node = build_dags(args)
+        results = label_papers_by_topic(
+            args, 
+            internal_collection,
+            subsection_titles
+        )
+        print(results)
+        
+        update_roots_with_labels(roots, results, internal_collection, args)
+        grouped = {dim:[
+        {
+            "paper_id":pid,
+            "title":paper.title,
+            "abstract":paper.abstract,
+            "summary":paper.summary,
+            "citations":paper.citations
+        }
+        for pid,paper in roots[dim].papers.items()
+    ] for dim in args.dimensions}
+        
+        context.dag_context = DAGContext(
+            dimensions=args.dimensions,
+            grouped_papers=grouped,
+            dag_structure={
+                "roots": {dim: root.to_dict() for dim, root in roots.items()},
+                "id2node": id2node,
+                "label2node": label2node
+            },
+            topic=topic,
+            outline=outline
+        )
+        dim_1 = args.dimensions[0]
+        dim_2 = args.dimensions[1]
+        grouped_dim_1 = grouped[dim_1]
+        grouped_dim_2 = grouped[dim_2]
+        
+        
+        end_time_DAG = time.time()
+        
+        # 记录agent执行
+        context.add_agent_execution(
+            agent_name="dag_builder",
+            input_data={"dimensions": args.dimensions},
+            output_data={"grouped_papers_count": sum(len(v) for v in grouped.values())},
+            execution_time=time.time() - start_time_DAG
+        )
+        
+        start_time_related_work = time.time()
+        # 生成related work
+        # 获取agent所需的完整上下文
+        rw_context = context.get_context_for_agent("related_work_generator")
+        prompt = generate_related_work_prompt_with_arxiv_trees(
+            source_abstract=context.source_paper_abstract,
+            dimensions=context.dag_context.dimensions,
+            grouped=context.dag_context.grouped_papers
+        )
+        related_work_with_citations = self.llm_client.get_completion(prompt)
+        related_work_with_citations = related_work_with_citations.replace("```json","").replace("```","")
+        related_work_with_citations = json_repair.loads(related_work_with_citations)
+        print("related_work_with_citations:")
+        print(related_work_with_citations)
+        
+        # 保存到context
+        context.related_work_original = related_work_with_citations["related_work"]
+        context.citation_context = CitationContext(
+            citations=related_work_with_citations["cite_ids"]
+        )
+        context.add_agent_execution(
+            agent_name="related_work_generator",
+            input_data={"papers_count": len(context.papers)},
+            output_data={"citations_count": len(context.citation_context.citations)},
+            execution_time=time.time() - start_time_related_work
+        )
+        related_work = related_work_with_citations["related_work"]
+        citations = related_work_with_citations["cite_ids"]
+        print("related_work:")
+        print(related_work)
+        print("citations:")
+        print(citations)
+        end_time_related_work = time.time()
+        
+        start_time_extract_cited_sentences = time.time()
+        # prompt_for_extract_cited_sentences = process_data_for_extract_cited_sentences(related_work)
+        # cited_sentences = self.llm_client.get_completion(prompt_for_extract_cited_sentences)
+        # cited_sentences = json_repair.loads(cited_sentences)
+        # print("cited_sentences:")
+        # print(cited_sentences)
+        
+        # judge_gemini = Judge(model="google/gemini-2.5-flash")
+        # judge_deepseek = Judge(model="deepseek-chat")
+        
+        # ids = [i for i in citations if "paper_id" in i and i["paper_id"] is not None]
+        
+        # selected_papers = relevant_pages
+        
+        client = DeepSeekClient(
+            api_key = os.environ.get("DEEPSEEK_API_KEY", ""),
+            model_name = "deepseek-chat"
+        )
+        start_time_feedback = time.time()
+        
+        # 使用增强版prompt,提供完整上下文
+        
+        feedback_context = context.get_context_for_agent("feedback_agent")
+        feedback_prompt = generate_enhanced_feedback_prompt(
+            related_work=context.related_work_original,
+            source_abstract=context.source_paper_abstract,
+            dag_context=context.dag_context.to_dict(),
+            papers=[p.to_dict() for p in context.papers],
+            citations=context.citation_context.citations
+        )
+        feedback = self.llm_client.get_completion(feedback_prompt)
+        print("feedback:")
+        print(feedback)
+        
+        context.add_agent_execution(
+            agent_name="feedback_agent",
+            input_data={"related_work_length": len(context.related_work_original)},
+            output_data={"feedback_length": len(feedback)},
+            execution_time=time.time() - start_time_feedback
+        )
+        
+        prompt_for_revision = generate_related_work_revision_prompt(abstract,related_work,feedback,citations,args.dimensions)
+        related_work_revision = client.get_completion(prompt_for_revision)
+        print("related_work_revision:")
+        print(related_work_revision)
+        related_work_revision = related_work_revision.replace("```json","").replace("```","")
+        related_work_revision_dict = json_repair.loads(related_work_revision)
+        related_work_revision = related_work_revision_dict["related_work"]
+        citations = related_work_revision_dict["cite_ids"]
+        end_time_feedback = time.time()
+        
+        related_work_revision,quotes_with_citation_info,validation_results,error_types = self.validate_and_correct_citations(related_work_revision,selected_papers,citations,arxiv_id)
+        end_time = time.time()
+        filtered_citations: list[str] = filter_citations(
+            related_works_section=related_work, citation_strings=[obj["citation"] for obj in relevant_pages[1:]]
+        )
+        
+        PROJECT_ROOT = Path(__file__).parent.parent.parent
+        results_dir = PROJECT_ROOT / f"results/{arxivid.replace('.','_')}"
+        # 保存
+        results_dir.mkdir(exist_ok=True,parents=True)
+        results_dict = {
+            "related_work": related_work_revision,
+            "citations": citations,
+            "quotes_with_citation_info": quotes_with_citation_info,
+            "validation_results": validation_results,
+            "error_types": error_types
+        }
+        with open(results_dir / f"results_{breadth}_{depth}_{diversity}.json", "w", encoding="utf-8") as f:
+            json.dump(results_dict, f, ensure_ascii=False, indent=4)
+        print("filtered_citations:")
+        print(filtered_citations)
+        date = datetime.date.today()
+        # os.makedirs(f"/home/liujian/project/2025-07/A2R-code-reproduction/results/{args.topic}/{date}", exist_ok=True)
+        # with open(f"/home/liujian/project/2025-07/A2R-code-reproduction/results/{args.topic}/{date}/related_work_with_citations.txt", "w", encoding="utf-8") as f:
+        #     f.write("="*50 + "\n" + "related_work" + "\n" + "="*50 + "\n" + related_work + "\n" + "="*50 + "\n" + "citations" + "\n" + "="*50 + "\n" + str(filtered_citations))
+        # with open(f"/home/liujian/project/2025-07/A2R-code-reproduction/results/{args.topic}/{date}/grouped_dim_1.json", "w", encoding="utf-8") as f:
+        #     json.dump(grouped_dim_1,f,ensure_ascii=False,indent=4)
+        # with open(f"/home/liujian/project/2025-07/A2R-code-reproduction/results/{args.topic}/{date}/grouped_dim_2.json", "w", encoding="utf-8") as f:
+        #     json.dump(grouped_dim_2,f,ensure_ascii=False,indent=4)
+        # with open(f"/home/liujian/project/2025-07/A2R-code-reproduction/results/{args.topic}/{date}/related_work_revision.txt", "w", encoding="utf-8") as f:
+        #     f.write("="*50 + "\n" + "related_work_revision" + "\n" + "="*50 + "\n" + related_work_revision + "\n" + "="*50 + "\n" + "citations" + "\n" + "="*50 + "\n" + str(filtered_citations))
+        if status_callback:
+            status_callback(8, f"Generated related work section with {len(filtered_citations)} citations")
+        args.dimensions = ["tasks", "datasets", "methodologies", "evaluation_methods"]
+        
+        
+        dag_time = end_time_DAG - start_time_DAG
+        related_work_time = end_time_related_work - start_time_related_work
+        feedback_time = end_time_feedback - start_time_feedback
+        summarization_time = end_time_summarization - start_time_summarization
+        all_time = end_time - start_time
+        print("Time taken for summarization:", round(summarization_time, 2), "seconds")
+        print("Time taken for DAG:", round(dag_time, 2), "seconds")
+        print("Time taken for related work:", round(related_work_time, 2), "seconds")
+        print("Time taken for feedback:", round(feedback_time, 2), "seconds")
+        print("Time taken for all process:", round(all_time, 2), "seconds")
+        time_dict = {
+            "summarization_time": summarization_time,
+            "dag_time": dag_time,
+            "related_work_time": related_work_time,
+            "feedback_time": feedback_time,
+            "all_time": all_time
+        }   
+        final= {"related_works": related_work_revision, "citations": filtered_citations, "selected_papers": relevant_pages,"time_dict": time_dict}
+        # with open(f"/home/liujian/project/2025-07/A2R-code-reproduction/results/{args.topic}/{date}/final.json", "w", encoding="utf-8") as f:
+        #     json.dump(final,f,ensure_ascii=False,indent=4)
+            
+        args.dimensions = ["tasks", "datasets", "methodologies", "evaluation_methods"]
+        
+        
+        return final
+    
+    def generate_related_work_MACG_FAST(
+            self,
+            target_abstract: str,
+            breadth: int,
+            depth: int,
+            diversity: float,
+            arxivid: str,
+            selected_papers: list[dict],
+            status_callback: Optional[Callable] = None,
+    ):
+        start_time = time.time()
+        internal_collection = {}
+        for paper in selected_papers:
+            idx = paper["cite_ids"][0]
+            title = paper["title"]
+            abstract = paper["abstract"]
+            response = paper["summary"]
+            arxiv_id = paper["arxiv_id"]
+            citations = paper["citation"]
+            internal_collection[idx] = Paper(
+                idx, 
+                title, 
+                abstract, 
+                label_opts=["tasks", "datasets", "methodologies", "evaluation_methods"], 
+                internal=True)
+            
+            internal_collection[idx].summary = response
+            internal_collection[idx].citations = get_arxiv_citation(arxiv_id)
+        
+        start_time_DAG = time.time()
+        # 生成本篇文章的topic
+        topic_prompt = generate_brief_topic_prompt(target_abstract)
+        topic = self.llm_client.get_completion(topic_prompt)
+        print("topic:")
+        print(topic)
+        
+        # 生成文献树
+        args.topic = topic
+        
+        roots,dags = run_dag_to_classifier(
+            args,
+            internal_collection
+        )
+        
+        print("正在生成可视化...")
+        
+        proj_root = Path(__file__).parent.parent.parent
+        dir = str(proj_root / "multi_dim_literature_visualizations")
+        visualizer,arxiv_trees = visualize_dags(roots, dags, output_dir=dir,topic=args.topic)
+
+        ## 为生成related work，先生成大纲
+        print("正在生成related work大纲...")
+        outline_prompt = generate_related_work_outline_prompt_various_1(target_abstract,arxiv_trees)
         outline = self.llm_client.get_completion(outline_prompt)
         outline = json_repair.loads(outline)
         
@@ -323,9 +640,13 @@ class Generator:
         grouped_dim_2 = grouped[dim_2]
         
         
+        end_time_DAG = time.time()
         
+        start_time_related_work = time.time()
         # 生成related work
-        prompt = generate_related_work_prompt_with_arxiv_trees(abstract,args.dimensions,grouped)
+        prompt = generate_related_work_prompt_with_arxiv_trees(target_abstract,args.dimensions,grouped)
+        with open("prompt.txt", "w", encoding="utf-8") as f:
+            f.write(prompt)
         related_work_with_citations = self.llm_client.get_completion(prompt)
         related_work_with_citations = related_work_with_citations.replace("```json","").replace("```","")
         related_work_with_citations = json_repair.loads(related_work_with_citations)
@@ -337,7 +658,9 @@ class Generator:
         print(related_work)
         print("citations:")
         print(citations)
+        end_time_related_work = time.time()
         
+        start_time_extract_cited_sentences = time.time()
         # prompt_for_extract_cited_sentences = process_data_for_extract_cited_sentences(related_work)
         # cited_sentences = self.llm_client.get_completion(prompt_for_extract_cited_sentences)
         # cited_sentences = json_repair.loads(cited_sentences)
@@ -350,59 +673,728 @@ class Generator:
         # ids = [i for i in citations if "paper_id" in i and i["paper_id"] is not None]
         
         # selected_papers = relevant_pages
+        messages = [
+            {
+                "role":"system",
+                "content":"You are a helpful literature review assistant that can do comparison, and accurate attribution."
+            },
+            {
+                "role":"user",
+                "content":prompt
+            },
+            {
+                "role":"assistant",
+                "content":"related_work to be revised: " + related_work + "\n" + "citations: " + str(citations)
+            }
+        ]
         
-        client = DeepSeekClient(
+        client = DeepSeekClientMultiTurn(
             api_key = os.environ.get("DEEPSEEK_API_KEY", ""),
             model_name = "deepseek-chat"
         )
+        start_time_feedback = time.time()
+        feedback_prompt = generate_original_related_work_feedback_prompt(related_work)
         
-        feedback_prompt = genrate_original_related_work_feedback_prompt(related_work)
         feedback = self.llm_client.get_completion(feedback_prompt)
         print("feedback:")
         print(feedback)
         
-        prompt_for_revision = generate_related_work_revision_prompt(abstract,related_work,feedback,citations,args.dimensions)
-        related_work_revision = client.get_completion(prompt_for_revision)
+        prompt_for_revision = generate_related_work_revision_prompt(target_abstract,related_work,feedback,citations,args.dimensions)
+        messages.append({
+            "role":"user",
+            "content":prompt_for_revision
+        })
+        related_work_revision = client.get_completion(messages)
         print("related_work_revision:")
         print(related_work_revision)
         related_work_revision = related_work_revision.replace("```json","").replace("```","")
         related_work_revision_dict = json_repair.loads(related_work_revision)
         related_work_revision = related_work_revision_dict["related_work"]
         citations = related_work_revision_dict["cite_ids"]
+        end_time_feedback = time.time()
         
-        related_work_revision,validation_results,error_types = self.validate_and_correct_citations(related_work_revision,selected_papers,citations)
-        
-        
-        
-           
+        related_work_revision,quotes_with_citation_info,validation_results,error_types = self.validate_and_correct_citations(related_work_revision,selected_papers,citations,arxivid)
+        end_time = time.time()
         filtered_citations: list[str] = filter_citations(
-            related_works_section=related_work, citation_strings=[obj["citation"] for obj in relevant_pages[1:]]
+            related_works_section=related_work, citation_strings=[obj["citations"] if "citations" in obj else "" for obj in selected_papers]
         )
         
-        
+        PROJECT_ROOT = Path(__file__).parent.parent.parent
+        results_dir = PROJECT_ROOT / f"results/{arxivid.replace('.','_')}"
+        # 保存
+        results_dir.mkdir(exist_ok=True,parents=True)
+        results_dict = {
+            "related_work": related_work_revision,
+            "citations": citations,
+            "quotes_with_citation_info": quotes_with_citation_info,
+            "validation_results": validation_results,
+            "error_types": error_types
+        }
+        with open(results_dir / f"results_{breadth}_{depth}_{diversity}.json", "w", encoding="utf-8") as f:
+            json.dump(results_dict, f, ensure_ascii=False, indent=4)
         print("filtered_citations:")
         print(filtered_citations)
-        date = datetime.date.today()
-        os.makedirs(f"/home/liujian/project/2025-07/A2R-code-reproduction/results/{args.topic}/{date}", exist_ok=True)
-        with open(f"/home/liujian/project/2025-07/A2R-code-reproduction/results/{args.topic}/{date}/related_work_with_citations.txt", "w", encoding="utf-8") as f:
-            f.write("="*50 + "\n" + "related_work" + "\n" + "="*50 + "\n" + related_work + "\n" + "="*50 + "\n" + "citations" + "\n" + "="*50 + "\n" + str(filtered_citations))
-        with open(f"/home/liujian/project/2025-07/A2R-code-reproduction/results/{args.topic}/{date}/grouped_dim_1.json", "w", encoding="utf-8") as f:
-            json.dump(grouped_dim_1,f,ensure_ascii=False,indent=4)
-        with open(f"/home/liujian/project/2025-07/A2R-code-reproduction/results/{args.topic}/{date}/grouped_dim_2.json", "w", encoding="utf-8") as f:
-            json.dump(grouped_dim_2,f,ensure_ascii=False,indent=4)
-        with open(f"/home/liujian/project/2025-07/A2R-code-reproduction/results/{args.topic}/{date}/related_work_revision.txt", "w", encoding="utf-8") as f:
-            f.write("="*50 + "\n" + "related_work_revision" + "\n" + "="*50 + "\n" + related_work_revision + "\n" + "="*50 + "\n" + "citations" + "\n" + "="*50 + "\n" + str(filtered_citations))
         if status_callback:
             status_callback(8, f"Generated related work section with {len(filtered_citations)} citations")
         args.dimensions = ["tasks", "datasets", "methodologies", "evaluation_methods"]
-        final= {"related_works": related_work_revision, "citations": filtered_citations, "selected_papers": relevant_pages}
-        with open(f"/home/liujian/project/2025-07/A2R-code-reproduction/results/{args.topic}/{date}/final.json", "w", encoding="utf-8") as f:
-            json.dump(final,f,ensure_ascii=False,indent=4)
+        
+        
+        dag_time = end_time_DAG - start_time_DAG
+        related_work_time = end_time_related_work - start_time_related_work
+        feedback_time = end_time_feedback - start_time_feedback
+        all_time = end_time - start_time
+        print("Time taken for DAG:", round(dag_time, 2), "seconds")
+        print("Time taken for related work:", round(related_work_time, 2), "seconds")
+        print("Time taken for feedback:", round(feedback_time, 2), "seconds")
+        print("Time taken for all process:", round(all_time, 2), "seconds")
+        time_dict = {
+            "dag_time": dag_time,
+            "related_work_time": related_work_time,
+            "feedback_time": feedback_time,
+            "all_time": all_time
+        }
+        prompt = generate_related_work_revise_citations_format(related_work_revision)
+        related_work_revision = self.llm_client.get_completion(prompt)
+        related_work_revision = related_work_revision.replace("```json","").replace("```","")
+        print("related_work_revision:")
+        print(related_work_revision)
+        final= {"related_works": related_work_revision, "citations": filtered_citations, "selected_papers": selected_papers,"time_dict": time_dict}
             
         args.dimensions = ["tasks", "datasets", "methodologies", "evaluation_methods"]
+        
+        
         return final
     
-    def validate_and_correct_citations(self, related_work, selected_papers, citations):
+    def generate_related_work_MACG_Only_Retrieval(
+            self,
+            abstract: str,
+            breadth: int,
+            depth: int,
+            diversity: float,
+            arxivid: str,
+            status_callback: Optional[Callable] = None,
+    ):
+        if status_callback:
+            status_callback(1, "Initializing")
+        print("摘要：", abstract)
+        print("向量化摘要并在milvus库中检索...")
+        
+        
+        # 向量化摘要并在milvus库中检索  
+        embedded_abstract = self.sentence_embedding_model.encode(abstract)
+        topic = self.topic_model.transform(abstract)
+        topic_id = topic[0][0]
+        
+        # 检索milvus库中与摘要最相似的论文
+        if status_callback:
+            status_callback(2, "Querying Vector DB for matches (this may take a while)")
+            
+        query_data: list[list[dict]] = self.db_client.search(
+            collection_name = "abstracts",
+            data = [embedded_abstract],
+            limit = 6 * breadth,
+            anns_field = "embedding",
+            search_params = {"metric_type": "COSINE", "params": {}},
+            output_fields = ["embedding"],
+        )
+        
+        if status_callback:
+            status_callback(3, f"Retrieved {len(query_data[0])} papers from the DB")
+            
+        # 清理DB响应数据
+        papers_data: list[dict] = query_data[0]
+        for obj in papers_data:
+            obj["embedding"] = obj["entity"]["embedding"]
+            obj.pop("entity")
+            
+        # 选择一个长列表的论文
+        selected_papers: list[dict] = select_diverse_papers_with_weighted_similarity(
+            paper_data = papers_data,
+            k = 3 * breadth,
+            diversity_weight = diversity)
+        
+        if status_callback:
+            status_callback(4, f"Selected {len(selected_papers)} papers for the longlist, retrieving full text(s) (this might take a while)")
+            
+        # 生成每个论文的页面嵌入
+        page_embeddings: list[list[dict]] = []
+        for paper in selected_papers:
+            arxiv_id = paper["id"]
+            result = process_arxiv_paper_with_embeddings(arxiv_id, self.topic_model)
+            if result:
+                page_embeddings.append(result)
+                
+        if status_callback:
+            status_callback(5, f"Generated page embeddings for {len(page_embeddings)} papers")
+            
+        # 生成一个短列表的论文（最多k页每篇，最多b篇）
+        relevant_pages: list[dict] = select_diverse_pages_for_top_b_papers(
+            paper_embeddings=page_embeddings,
+            input_string=abstract,
+            topic_model=self.topic_model,
+            k=depth,
+            b=breadth,
+            diversity_weight=diversity,
+            skip_first=False,
+        )
+        start_time = time.time()
+        # with open("relevant_pages.json", "w", encoding="utf-8") as f:
+        #     json.dump(relevant_pages, f, indent=4, ensure_ascii=False)
+
+        if status_callback:
+            status_callback(6, f"Selected {len(relevant_pages)} papers for the shortlist")
+        
+        selected_papers = []
+        
+
+        internal_collection = {}
+        data = []
+        id = 0
+        start_time_summarization = time.time()
+        # Generate summaries for individual papers (taking all relevant pages into account)
+        for obj in relevant_pages[:]:
+            # Because paper_id != arXiv_id -> retrieve arXiv id/
+            arxiv_id = papers_data[obj["paper_id"]]["id"]
+            arxiv_abstract = get_arxiv_abstract(arxiv_id)
+            text_segments = obj["text"]
+            obj["cite_ids"] = [id]
+            title = get_arxiv_title(arxiv_id)
+            
+            # Create prompt
+            prompt = generate_summary_prompt_with_page_content(
+                abstract_source_paper=abstract,
+                abstract_to_be_cited=arxiv_abstract,
+                page_text_to_be_cited=text_segments,
+                sentence_count=5,
+            )
+            
+            internal_collection[id] = Paper(
+                id, 
+                title, 
+                arxiv_abstract, 
+                label_opts=["tasks", "datasets", "methodologies", "evaluation_methods"], 
+                internal=True
+            )
+            temp_dict = {"Title": title, "Abstract": arxiv_abstract}
+            data.append(temp_dict)            
+            # Use the appropriate LLM client based on the provider
+            response: str = self.llm_client.get_completion(prompt)
+            obj["summary"] = response
+            
+            obj["citation"] = get_arxiv_citation(arxiv_id)
+            internal_collection[id].summary = response
+            internal_collection[id].citations = get_arxiv_citation(arxiv_id)
+            idx = {
+                "cite_ids":[id],
+                "title":title,
+                "abstract":arxiv_abstract,
+                "summary":response,
+                "arxiv_id":arxiv_id,
+                "citations":get_arxiv_citation(arxiv_id)
+            }
+            selected_papers.append(idx)
+            id += 1
+        # with open("internal_collection.json", "w", encoding="utf-8") as f:
+        #     json.dump(data, f, indent=4, ensure_ascii=False)
+        end_time_summarization = time.time()
+        
+        PROJECT_ROOT = Path(__file__).parent.parent.parent
+        time = datetime.date.today()
+        results_dir = PROJECT_ROOT / f"selected_papers/{arxivid.replace('.','_')}/{time}"
+        results_dir.mkdir(exist_ok=True,parents=True)
+        with open(f"{results_dir}/{breadth}_{depth}_{diversity}.json", "w", encoding="utf-8") as f:
+            json.dump(selected_papers, f, indent=4, ensure_ascii=False)
+        
+        
+        
+        
+    
+    def generate_related_work_MACG(
+            self,
+            abstract: str,
+            breadth: int,
+            depth: int,
+            diversity: float,
+            arxivid: str,
+            status_callback: Optional[Callable] = None,
+    ):
+        token_usage = {
+        "stages": {
+            "summarization": 0,
+            "topic": 0,
+            "outline": 0,
+            "DAG": 0,
+            "related_work": 0,
+            "feedback": 0,
+            "revision": 0,
+            "validation": 0
+        },
+        "total_input_tokens": 0,
+        "total_output_tokens": 0
+    }
+        if status_callback:
+            status_callback(1, "Initializing")
+        print("摘要：", abstract)
+        print("向量化摘要并在milvus库中检索...")
+        
+        
+        # 向量化摘要并在milvus库中检索  
+        embedded_abstract = self.sentence_embedding_model.encode(abstract)
+        topic = self.topic_model.transform(abstract)
+        topic_id = topic[0][0]
+        
+        
+        # 检索milvus库中与摘要最相似的论文
+        if status_callback:
+            status_callback(2, "Querying Vector DB for matches (this may take a while)")
+            
+        query_data: list[list[dict]] = self.db_client.search(
+            collection_name = "abstracts",
+            data = [embedded_abstract],
+            limit = 6 * breadth,
+            anns_field = "embedding",
+            search_params = {"metric_type": "COSINE", "params": {}},
+            output_fields = ["embedding"],
+        )
+        
+        if status_callback:
+            status_callback(3, f"Retrieved {len(query_data[0])} papers from the DB")
+            
+        # 清理DB响应数据
+        papers_data: list[dict] = query_data[0]
+        for obj in papers_data:
+            obj["embedding"] = obj["entity"]["embedding"]
+            obj.pop("entity")
+            
+        # 选择一个长列表的论文
+        selected_papers: list[dict] = select_diverse_papers_with_weighted_similarity(
+            paper_data = papers_data,
+            k = 3 * breadth,
+            diversity_weight = diversity)
+        
+        if status_callback:
+            status_callback(4, f"Selected {len(selected_papers)} papers for the longlist, retrieving full text(s) (this might take a while)")
+            
+        # 生成每个论文的页面嵌入
+        page_embeddings: list[list[dict]] = []
+        for paper in selected_papers:
+            arxiv_id = paper["id"]
+            result = process_arxiv_paper_with_embeddings(arxiv_id, self.topic_model)
+            if result:
+                page_embeddings.append(result)
+                
+        if status_callback:
+            status_callback(5, f"Generated page embeddings for {len(page_embeddings)} papers")
+            
+        # 生成一个短列表的论文（最多k页每篇，最多b篇）
+        relevant_pages: list[dict] = select_diverse_pages_for_top_b_papers(
+            paper_embeddings=page_embeddings,
+            input_string=abstract,
+            topic_model=self.topic_model,
+            k=depth,
+            b=breadth,
+            diversity_weight=diversity,
+            skip_first=False,
+        )
+        start_time = time.time()
+        # with open("relevant_pages.json", "w", encoding="utf-8") as f:
+        #     json.dump(relevant_pages, f, indent=4, ensure_ascii=False)
+
+        if status_callback:
+            status_callback(6, f"Selected {len(relevant_pages)} papers for the shortlist")
+        selected_papers_for_id = selected_papers
+        selected_papers = []
+        internal_collection = {}
+        data = []
+        id = 0
+        start_time_summarization = time.time()
+        
+        # 创建summarization prompts目录
+        summarization_prompts_dir = results_dir / "prompts" / "00_summarization"
+        summarization_prompts_dir.mkdir(exist_ok=True, parents=True)
+        
+        # Generate summaries for individual papers (taking all relevant pages into account)
+        for obj in relevant_pages[1:]:
+            # Because paper_id != arXiv_id -> retrieve arXiv id/
+            # arxiv_id = papers_data[obj["paper_id"]]["id"]
+            # arxiv_abstract = get_arxiv_abstract(arxiv_id)
+            # text_segments = obj["text"]
+            # obj["cite_ids"] = [id]
+            # title = get_arxiv_title(arxiv_id)
+            
+            arxiv_id = selected_papers_for_id[obj["paper_id"]]["id"]
+            arxiv_abstract = get_arxiv_abstract(arxiv_id)
+            title = get_arxiv_title(arxiv_id)
+            text_segments = obj["text"]
+            
+            # Create prompt
+            prompt = generate_summary_prompt_with_page_content(
+                abstract_source_paper=abstract,
+                abstract_to_be_cited=arxiv_abstract,
+                page_text_to_be_cited=text_segments,
+                sentence_count=5,
+            )
+            
+            token_usage["stages"]["summarization"] += self._count_tokens(prompt)
+            token_usage["total_input_tokens"] += self._count_tokens(prompt)
+            
+            internal_collection[id] = Paper(
+                id, 
+                title, 
+                arxiv_abstract, 
+                label_opts=["tasks", "datasets", "methodologies", "evaluation_methods"], 
+                internal=True
+            )
+            temp_dict = {"Title": title, "Abstract": arxiv_abstract}
+            
+            data.append(temp_dict)            
+            # Use the appropriate LLM client based on the provider
+            response: str = self.llm_client.get_completion(prompt)
+            
+            token_usage["stages"]["summarization"] += self._count_tokens(response)
+            token_usage["total_output_tokens"] += self._count_tokens(response)
+            obj["summary"] = response
+            
+            obj["citation"] = get_arxiv_citation(arxiv_id)
+            
+            internal_collection[id].summary = response
+            internal_collection[id].citations = get_arxiv_citation(arxiv_id)
+            idx = {
+                "cite_ids":[id],
+                "title":title,
+                "abstract":arxiv_abstract,
+                "summary":response,
+                "arxiv_id":arxiv_id,
+                "citations":get_arxiv_citation(arxiv_id)
+            }
+            selected_papers.append(idx)
+            
+            # 保存summarization prompt和response
+            with open(summarization_prompts_dir / f"paper_{id:02d}_{arxiv_id}_prompt.txt", "w", encoding="utf-8") as f:
+                f.write("="*80 + "\n")
+                f.write(f"PAPER SUMMARIZATION PROMPT - {title}\n")
+                f.write(f"Paper ID: {id} | ArXiv ID: {arxiv_id}\n")
+                f.write("="*80 + "\n\n")
+                f.write(prompt)
+            
+            with open(summarization_prompts_dir / f"paper_{id:02d}_{arxiv_id}_response.txt", "w", encoding="utf-8") as f:
+                f.write("="*80 + "\n")
+                f.write(f"PAPER SUMMARIZATION RESPONSE - {title}\n")
+                f.write(f"Paper ID: {id} | ArXiv ID: {arxiv_id}\n")
+                f.write("="*80 + "\n\n")
+                f.write(response)
+            
+            id += 1
+        # with open("internal_collection.json", "w", encoding="utf-8") as f:
+        #     json.dump(data, f, indent=4, ensure_ascii=False)
+        end_time_summarization = time.time()
+        
+        PROJECT_ROOT = Path(__file__).parent.parent.parent
+        results_dir = PROJECT_ROOT / f"selected_papers/{arxivid.replace('.','_')}"
+        
+
+        # 确保目录存在
+        results_dir.mkdir(exist_ok=True,parents=True)
+        with open(f"{results_dir}/{breadth}_{depth}_{diversity}.json", "w", encoding="utf-8") as f:
+            json.dump(selected_papers, f, indent=4, ensure_ascii=False)
+        
+        # with open("/home/liujian/internal_collection.json", "r", encoding="utf-8") as f:
+        #       internal_collection = json.load(f)
+        if status_callback:
+            status_callback(7, "Generated summaries of papers (and their pages)")
+        
+        start_time_DAG = time.time()
+        
+        # 创建prompts输出目录
+        prompts_output_dir = results_dir / "prompts"
+        prompts_output_dir.mkdir(exist_ok=True, parents=True)
+        
+        # 生成本篇文章的topic
+        topic_prompt = generate_brief_topic_prompt(abstract)
+        # 保存topic prompt
+        with open(prompts_output_dir / "01_topic_prompt.txt", "w", encoding="utf-8") as f:
+            f.write("="*80 + "\n")
+            f.write("TOPIC GENERATION PROMPT\n")
+            f.write("="*80 + "\n\n")
+            f.write(topic_prompt)
+        
+        topic = self.llm_client.get_completion(topic_prompt)
+        
+        # 保存topic response
+        with open(prompts_output_dir / "01_topic_response.txt", "w", encoding="utf-8") as f:
+            f.write("="*80 + "\n")
+            f.write("TOPIC GENERATION RESPONSE\n")
+            f.write("="*80 + "\n\n")
+            f.write(topic)
+        
+        print("topic:")
+        print(topic)
+        token_usage["stages"]["topic"] += self._count_tokens(topic_prompt)
+        token_usage["total_input_tokens"] += self._count_tokens(topic_prompt)
+        # 生成文献树
+        args.topic = topic
+        
+        roots,dags = run_dag_to_classifier(
+            args,
+            internal_collection
+        )
+
+        print("正在生成可视化...")
+        
+        proj_root = Path(__file__).parent.parent.parent
+        dir = str(proj_root / "multi_dim_literature_visualizations")
+        visualizer,arxiv_trees = visualize_dags(roots, dags, output_dir=dir,topic=args.topic)
+
+        ## 为生成related work，先生成大纲
+        print("正在生成related work大纲...")
+        outline_prompt = generate_related_work_outline_prompt_various_1(abstract,arxiv_trees)
+        
+        # 保存outline prompt
+        with open(prompts_output_dir / "02_outline_prompt.txt", "w", encoding="utf-8") as f:
+            f.write("="*80 + "\n")
+            f.write("OUTLINE GENERATION PROMPT\n")
+            f.write("="*80 + "\n\n")
+            f.write(outline_prompt)
+        
+        token_usage["stages"]["DAG"] += self._count_tokens(outline_prompt)
+        token_usage["total_input_tokens"] += self._count_tokens(outline_prompt)
+        outline = self.llm_client.get_completion(outline_prompt)
+        outline = json_repair.loads(outline)
+        
+        # 保存outline response
+        with open(prompts_output_dir / "02_outline_response.txt", "w", encoding="utf-8") as f:
+            f.write("="*80 + "\n")
+            f.write("OUTLINE GENERATION RESPONSE\n")
+            f.write("="*80 + "\n\n")
+            f.write(json.dumps(outline, ensure_ascii=False, indent=4))
+
+        print("outline:")
+        print(outline)
+        
+        subsection_titles = outline["outline"]
+        token_usage["stages"]["DAG"] += self._count_tokens(outline_prompt)
+        token_usage["total_input_tokens"] += self._count_tokens(outline_prompt)
+        
+        token_usage["stages"]["outline"] += self._count_tokens(str(outline))
+        token_usage["total_output_tokens"] += self._count_tokens(str(outline))
+        args.dimensions = subsection_titles
+        roots,dags,id2node,label2node = build_dags(args)
+
+        results = label_papers_by_topic(
+            args, 
+            internal_collection,
+            subsection_titles
+        )
+        print(results)
+
+        update_roots_with_labels(roots, results, internal_collection, args)
+        grouped = {dim:[
+        {
+            "paper_id":pid,
+            "title":paper.title,
+            "abstract":paper.abstract,
+            "summary":paper.summary,
+            "citations":paper.citations
+        }
+        for pid,paper in roots[dim].papers.items()
+    ] for dim in args.dimensions}
+        
+        dim_1 = args.dimensions[0]
+        dim_2 = args.dimensions[1]
+        grouped_dim_1 = grouped[dim_1]
+        grouped_dim_2 = grouped[dim_2]
+        
+        
+        end_time_DAG = time.time()
+        
+        start_time_related_work = time.time()
+        # 生成related work
+        prompt = generate_related_work_prompt_with_arxiv_trees(abstract,args.dimensions,grouped)
+        
+        # 保存related work generation prompt
+        with open(prompts_output_dir / "03_related_work_generation_prompt.txt", "w", encoding="utf-8") as f:
+            f.write("="*80 + "\n")
+            f.write("RELATED WORK GENERATION PROMPT\n")
+            f.write("="*80 + "\n\n")
+            f.write(prompt)
+        
+        token_usage["stages"]["related_work"] += self._count_tokens(prompt)
+        token_usage["total_input_tokens"] += self._count_tokens(prompt)
+        related_work_with_citations = self.llm_client.get_completion(prompt)
+        related_work_with_citations = related_work_with_citations.replace("```json","").replace("```","")
+        related_work_with_citations = json_repair.loads(related_work_with_citations)
+        
+        # 保存related work generation response
+        with open(prompts_output_dir / "03_related_work_generation_response.txt", "w", encoding="utf-8") as f:
+            f.write("="*80 + "\n")
+            f.write("RELATED WORK GENERATION RESPONSE\n")
+            f.write("="*80 + "\n\n")
+            f.write(json.dumps(related_work_with_citations, ensure_ascii=False, indent=4))
+        
+        print("related_work_with_citations:")
+        print(related_work_with_citations)
+        token_usage["stages"]["related_work"] += self._count_tokens(str(related_work_with_citations))
+        token_usage["total_output_tokens"] += self._count_tokens(str(related_work_with_citations))
+        related_work = related_work_with_citations["related_work"]
+        citations = related_work_with_citations["cite_ids"]
+        print("related_work:")
+        print(related_work)
+        print("citations:")
+        print(citations)
+        
+        end_time_related_work = time.time()
+        
+        messages = [
+            {
+                "role":"system",
+                "content":"You are a helpful literature review assistant that can do comparison, and accurate attribution."
+            },
+            {
+                "role":"user",
+                "content":prompt
+            },
+            {
+                "role":"assistant",
+                "content":"related_work to be revised: " + related_work + "\n" + "citations: " + str(citations)
+            }
+        ]
+        
+        client = DeepSeekClientMultiTurn(
+            api_key = os.environ.get("DEEPSEEK_API_KEY", ""),
+            model_name = "deepseek-chat"
+        )
+        start_time_feedback = time.time()
+        feedback_prompt = generate_original_related_work_feedback_prompt(related_work)
+        
+        # 保存feedback prompt
+        with open(prompts_output_dir / "04_feedback_prompt.txt", "w", encoding="utf-8") as f:
+            f.write("="*80 + "\n")
+            f.write("FEEDBACK GENERATION PROMPT\n")
+            f.write("="*80 + "\n\n")
+            f.write(feedback_prompt)
+        
+        token_usage["stages"]["feedback"] += self._count_tokens(feedback_prompt)
+        token_usage["total_input_tokens"] += self._count_tokens(feedback_prompt)
+        feedback = self.llm_client.get_completion(feedback_prompt)
+        
+        # 保存feedback response
+        with open(prompts_output_dir / "04_feedback_response.txt", "w", encoding="utf-8") as f:
+            f.write("="*80 + "\n")
+            f.write("FEEDBACK GENERATION RESPONSE\n")
+            f.write("="*80 + "\n\n")
+            f.write(feedback)
+        
+        print("feedback:")
+        print(feedback)
+        token_usage["stages"]["feedback"] += self._count_tokens(str(feedback))
+        token_usage["total_output_tokens"] += self._count_tokens(feedback)
+        prompt_for_revision = generate_related_work_revision_prompt(abstract,related_work,feedback,citations,args.dimensions)
+        
+        # 保存revision prompt
+        with open(prompts_output_dir / "05_revision_prompt.txt", "w", encoding="utf-8") as f:
+            f.write("="*80 + "\n")
+            f.write("REVISION GENERATION PROMPT\n")
+            f.write("="*80 + "\n\n")
+            f.write(prompt_for_revision)
+        
+        messages.append({
+            "role":"user",
+            "content":prompt_for_revision
+        })
+        token_usage["stages"]["revision"] += self._count_tokens(prompt_for_revision)
+        token_usage["total_input_tokens"] += self._count_tokens(prompt_for_revision)
+        related_work_revision = client.get_completion(messages)
+        
+        print("related_work_revision:")
+        print(related_work_revision)
+        related_work_revision = related_work_revision.replace("```json","").replace("```","")
+        token_usage["stages"]["revision"] += self._count_tokens(related_work_revision)
+        token_usage["total_output_tokens"] += self._count_tokens(str(related_work_revision))
+        related_work_revision_dict = json_repair.loads(related_work_revision)
+        
+        # 保存revision response
+        with open(prompts_output_dir / "05_revision_response.txt", "w", encoding="utf-8") as f:
+            f.write("="*80 + "\n")
+            f.write("REVISION GENERATION RESPONSE\n")
+            f.write("="*80 + "\n\n")
+            f.write(json.dumps(related_work_revision_dict, ensure_ascii=False, indent=4))
+        
+        related_work_revision = related_work_revision_dict["related_work"]
+        citations = related_work_revision_dict["cite_ids"]
+        end_time_feedback = time.time()
+          
+        related_work_revision,quotes_with_citation_info,validation_results,error_types = self.validate_and_correct_citations(related_work_revision,selected_papers,citations,arxivid)
+        token_usage["stages"]["validation"] += self._count_tokens(prompt_for_revision)
+        token_usage["total_input_tokens"] += self._count_tokens(prompt_for_revision)
+        end_time = time.time()
+        filtered_citations: list[str] = filter_citations(
+            related_works_section=related_work, citation_strings=[obj["citation"] for obj in relevant_pages[1:]]
+        )
+
+        PROJECT_ROOT = Path(__file__).parent.parent.parent
+        results_dir = PROJECT_ROOT / f"results/{arxivid.replace('.','_')}"
+        # 保存
+        results_dir.mkdir(exist_ok=True,parents=True)
+        results_dict = {
+            "related_work": related_work_revision,
+            "quotes_with_citation_info": quotes_with_citation_info,
+            "citations": citations,
+            "validation_results": validation_results,
+            "error_types": error_types
+        }
+        with open(results_dir / f"results_{breadth}_{depth}_{diversity}.json", "w", encoding="utf-8") as f:
+            json.dump(results_dict, f, ensure_ascii=False, indent=4)
+        print("filtered_citations:")
+        print(filtered_citations)
+        date = datetime.date.today()
+        # os.makedirs(f"/home/liujian/project/2025-07/A2R-code-reproduction/results/{args.topic}/{date}", exist_ok=True)
+        # with open(f"/home/liujian/project/2025-07/A2R-code-reproduction/results/{args.topic}/{date}/related_work_with_citations.txt", "w", encoding="utf-8") as f:
+        #     f.write("="*50 + "\n" + "related_work" + "\n" + "="*50 + "\n" + related_work + "\n" + "="*50 + "\n" + "citations" + "\n" + "="*50 + "\n" + str(filtered_citations))
+        # with open(f"/home/liujian/project/2025-07/A2R-code-reproduction/results/{args.topic}/{date}/grouped_dim_1.json", "w", encoding="utf-8") as f:
+        #     json.dump(grouped_dim_1,f,ensure_ascii=False,indent=4)
+        # with open(f"/home/liujian/project/2025-07/A2R-code-reproduction/results/{args.topic}/{date}/grouped_dim_2.json", "w", encoding="utf-8") as f:
+        #     json.dump(grouped_dim_2,f,ensure_ascii=False,indent=4)
+        # with open(f"/home/liujian/project/2025-07/A2R-code-reproduction/results/{args.topic}/{date}/related_work_revision.txt", "w", encoding="utf-8") as f:
+        #     f.write("="*50 + "\n" + "related_work_revision" + "\n" + "="*50 + "\n" + related_work_revision + "\n" + "="*50 + "\n" + "citations" + "\n" + "="*50 + "\n" + str(filtered_citations))
+        if status_callback:
+            status_callback(8, f"Generated related work section with {len(filtered_citations)} citations")
+        args.dimensions = ["tasks", "datasets", "methodologies", "evaluation_methods"]
+        
+        
+        dag_time = end_time_DAG - start_time_DAG
+        related_work_time = end_time_related_work - start_time_related_work
+        feedback_time = end_time_feedback - start_time_feedback
+        summarization_time = end_time_summarization - start_time_summarization
+        all_time = end_time - start_time
+        print("Time taken for summarization:", round(summarization_time, 2), "seconds")
+        print("Time taken for DAG:", round(dag_time, 2), "seconds")
+        print("Time taken for related work:", round(related_work_time, 2), "seconds")
+        print("Time taken for feedback:", round(feedback_time, 2), "seconds")
+        print("Time taken for all process:", round(all_time, 2), "seconds")
+        time_dict = {
+            "summarization_time": summarization_time,
+            "dag_time": dag_time,
+            "related_work_time": related_work_time,
+            "feedback_time": feedback_time,
+            "all_time": all_time
+        } 
+        
+        final= {"related_works": related_work_revision, "citations": filtered_citations, "selected_papers": relevant_pages,"time_dict": time_dict}
+        # with open(f"/home/liujian/project/2025-07/A2R-code-reproduction/results/{args.topic}/{date}/final.json", "w", encoding="utf-8") as f:
+        #     json.dump(final,f,ensure_ascii=False,indent=4)
+            
+        args.dimensions = ["tasks", "datasets", "methodologies", "evaluation_methods"]
+        
+        token_usage["stages"]["validation"] += self._count_tokens(str(quotes_with_citation_info))
+        token_usage["total_input_tokens"] += self._count_tokens(str(quotes_with_citation_info)) 
+        
+        token_usage["stages"]["validation"] += self._count_tokens(str(validation_results))
+        token_usage["total_output_tokens"] += self._count_tokens(str(validation_results))
+        
+        
+        return final,token_usage
+    
+    def validate_and_correct_citations(self, related_work, selected_papers, citations,arxiv_id):
         """
         验证和纠正引用错误的内联方法
         """
@@ -412,6 +1404,8 @@ class Generator:
         cited_sentences = json_repair.loads(cited_sentences)
         
         # 2. 构建引用验证数据
+        # The code snippet you provided is a comment in Python. It appears to be describing a variable
+        # or data structure called `quotes_with_citation_info`. The triple hash symbols (`
         quotes_with_citation_info = self._build_citation_verification_data(
             cited_sentences, selected_papers, citations
         )
@@ -446,7 +1440,8 @@ class Generator:
         print(validation_results["avg_citation_per_sentence"])
         print("="*50)
         
-        return corrected_related_work, validation_results, error_types
+        
+        return corrected_related_work, quotes_with_citation_info, validation_results, error_types
     
     
     def _count_sentences(self,text):
@@ -464,8 +1459,7 @@ class Generator:
         """构建引用验证所需的数据结构"""
         quotes_with_citation_info = {quote: [] for quote in quotes}
         ids = [i for i in cite_ids if "paper_id" in i and i["paper_id"] is not None]
-        print("ids:")
-        print(ids)
+        
         for cited_id in ids:
             for id,selected_paper in enumerate(selected_papers):
                 cited_paper_id = cited_id["paper_id"]
@@ -477,6 +1471,7 @@ class Generator:
                 try:
                     if int(cited_paper_id) == int(selected_paper["cite_ids"][0]):
                         cited_id["summary"] = selected_paper["summary"]
+                        cited_id["abstract"] = selected_paper["abstract"]
                 except Exception as e:
                     print(e)
                     continue
@@ -489,19 +1484,19 @@ class Generator:
                 if "summary" not in cited_id:
                     continue
                 if c_text in quote:
-                    quotes_with_citation_info[quote].append(" cited_text: " + cited_id["citation_text"] + " summary: " + cited_id["summary"])
+                    quotes_with_citation_info[quote].append(" cited_text: " + cited_id["citation_text"] + " summary: " + cited_id["abstract"])
                 elif c_text.split(".")[0] in quote and year in quote:
-                    quotes_with_citation_info[quote].append(" cited_text: " + cited_id["citation_text"] + " summary: " + cited_id["summary"])
+                    quotes_with_citation_info[quote].append(" cited_text: " + cited_id["citation_text"] + " summary: " + cited_id["abstract"])
                 elif c_text.split("(")[0] in quote and year in quote:
-                    quotes_with_citation_info[quote].append(" cited_text: " + cited_id["citation_text"] + " summary: " + cited_id["summary"])
+                    quotes_with_citation_info[quote].append(" cited_text: " + cited_id["citation_text"] + " summary: " + cited_id["abstract"])
                 elif c_text.split(",")[0] in quote and year in quote:
-                    quotes_with_citation_info[quote].append(" cited_text: " + cited_id["citation_text"] + " summary: " + cited_id["summary"])
+                    quotes_with_citation_info[quote].append(" cited_text: " + cited_id["citation_text"] + " summary: " + cited_id["abstract"])
                 elif c_text.split("et")[0] in quote and year in quote:
-                    quotes_with_citation_info[quote].append(" cited_text: " + cited_id["citation_text"] + " summary: " + cited_id["summary"])
+                    quotes_with_citation_info[quote].append(" cited_text: " + cited_id["citation_text"] + " summary: " + cited_id["abstract"])
                 elif c_text.split("&")[0] in quote and year in quote:
-                    quotes_with_citation_info[quote].append(" cited_text: " + cited_id["citation_text"] + " summary: " + cited_id["summary"])
+                    quotes_with_citation_info[quote].append(" cited_text: " + cited_id["citation_text"] + " summary: " + cited_id["abstract"])
                 elif c_text.split("and")[0] in quote and year in quote:
-                    quotes_with_citation_info[quote].append(" cited_text: " + cited_id["citation_text"] + " summary: " + cited_id["summary"])
+                    quotes_with_citation_info[quote].append(" cited_text: " + cited_id["citation_text"] + " summary: " + cited_id["abstract"])
         print("quotes_with_citation_info:")
         print(quotes_with_citation_info)
         return quotes_with_citation_info
@@ -533,13 +1528,13 @@ class Generator:
             source = "\n".join(q)
             print(f"source: {source}")
             print(f"quote: {quote}")
-            score = judge_gemini.get_pair_score_new(source, quote)
+            score = judge_gemini._get_pair_score_new(source, quote)
             print(f"{i}. {score} by gemini")
             if score.lower() == "yes":
                 yes_gemini.append({"id": i, "claim": quote, "source": source})
             else:
                 no_gemini.append({"id": i, "claim": quote, "source": source})
-            score = judge_deepseek.get_pair_score_new(source, quote)
+            score = judge_deepseek._get_pair_score_new(source, quote)
             print(f"{i}. {score} by deepseek")
             if score.lower() == "yes":
                 yes_deepseek.append({"id": i, "claim": quote, "source": source})
@@ -719,7 +1714,7 @@ class Generator:
             error["key_changes"] = result["key_changes"]
             print(f"corrected_claim: {result['corrected_claim']}")
             print(f"explanation: {result['explanation']}")
-            score = judge_gemini.get_pair_score_new(source, result["corrected_claim"])
+            score = judge_gemini._get_pair_score_new(source, result["corrected_claim"])
             print(f"score: {score}")
             print("-"*100)
             if score == "Yes":
@@ -762,6 +1757,7 @@ class Generator:
         breadth: int,
         depth: int,
         diversity: float,
+        arxivid: str,
         status_callback: Optional[Callable] = None,
     ) -> dict[str, str | list[str] | list[dict]]:
     
@@ -825,6 +1821,13 @@ class Generator:
         for paper in selected_papers:
             arxiv_id = paper["id"]
             result = process_arxiv_paper_with_embeddings(arxiv_id, self.topic_model)
+            text = result[0]["text"]
+            
+            dir = Path(__file__).parent.parent.parent / "text" / arxivid
+            dir.mkdir(exist_ok = True,parents = True)
+            with open(dir / f"text_{arxiv_id}.txt", "w", encoding="utf-8") as f:
+                f.write(text)
+            
             if result:
                 page_embeddings.append(result)
 
@@ -844,17 +1847,36 @@ class Generator:
 
         if status_callback:
             status_callback(6, f"Selected {len(relevant_pages)} papers for the shortlist")
+            
+        selected_papers_for_id = selected_papers
+        selected_papers = []
 
         internal_collection = {}
         data = []
+        id = 0
+            # with open("relevant_pages.json", "w", encoding="utf-8") as f:
+            #     json.dump(relevant_pages, f, indent=4, ensure_ascii=False)
         # Generate summaries for individual papers (taking all relevant pages into account)
         for obj in relevant_pages[1:]:
             # Because paper_id != arXiv_id -> retrieve arXiv id/
-            arxiv_id = papers_data[obj["paper_id"]]["id"]
+            # 不要使用papers_data中的索引，要使用selected_papers中的索引，这样才能对齐
+            # print(obj["paper_id"])
+            # arxiv_id = papers_data[obj["paper_id"]]["id"]
+            # print("arxiv_id from obj:")
+            # print(arxiv_id)
+            # arxiv_abstract = get_arxiv_abstract(arxiv_id)
+            # text_segments = obj["text"]
+            # title = get_arxiv_title(arxiv_id)
+            
+            arxiv_id = selected_papers_for_id[obj["paper_id"]]["id"]
             arxiv_abstract = get_arxiv_abstract(arxiv_id)
+            title = get_arxiv_title(arxiv_id)
             text_segments = obj["text"]
             
-            title = get_arxiv_title(arxiv_id)
+            # dir = Path(__file__).parent.parent.parent / "relevant_pages" / arxivid
+            # dir.mkdir(exist_ok=True,parents=True)
+            # with open(dir / f"relevant_pages_{arxiv_id_from_selected_papers}.txt", "w", encoding="utf-8") as f:
+            #     f.write("arxiv_id_from_obj: "+arxiv_id+"\n"+"arxiv_id_from_selected_papers: "+arxiv_id_from_selected_papers+"\n"+"arxiv_abstract_from_obj: "+arxiv_abstract+"\n"+"arxiv_abstract_from_selected_papers: "+arxiv_abstract_from_selected_papers+"\n"+"arxiv_title_from_obj: "+title+"\n"+"arxiv_title_from_selected_papers: "+arxiv_title_from_selected_papers+"\n"+"text_segments_from_obj: "+"\n".join(text_segments)+"\n"+"text_segments_from_selected_papers: "+"\n".join(text_segments_from_selected_papers))
             
             # Create prompt
             prompt = generate_summary_prompt_with_page_content(
@@ -877,27 +1899,52 @@ class Generator:
             obj["summary"] = response
             obj["citation"] = get_arxiv_citation(arxiv_id)
             
+            idx = {
+                "cite_ids":[id],
+                "title":title,
+                "abstract":arxiv_abstract,
+                "summary":response,
+                "arxiv_id":arxiv_id,
+                "citation":get_arxiv_citation(arxiv_id)
+            }
             
+            
+            selected_papers.append(idx)
+            id += 1
+            dir = Path(__file__).parent.parent.parent / "prompt" / arxivid
+            dir.mkdir(exist_ok=True,parents=True)
+            with open(dir / f"prompt_{arxiv_id}_2.txt", "w", encoding="utf-8") as f:
+                f.write(prompt+"\n"+"="*50+"\n"+"response" +"\n"+"="*50+"\n"+response)
+
+        dir = Path(__file__).parent.parent.parent / "selected_papers" / arxivid
+        dir.mkdir(exist_ok=True,parents=True)
+        with open(dir / f"selected_papers_{arxivid}_{breadth}_{depth}_{diversity}.json", "w", encoding="utf-8") as f:
+            json.dump(selected_papers, f, indent=4, ensure_ascii=False)
             
         if status_callback:
             status_callback(7, "Generated summaries of papers (and their pages)")
             
         # Generate the final related works section text
         prompt = generate_related_work_prompt(
-            source_abstract=abstract, data=relevant_pages, paragraph_count=math.ceil(breadth / 2), add_summary=False
+            source_abstract=abstract, data=selected_papers, paragraph_count=math.ceil(breadth / 2), add_summary=False
         )
 
         # Use the appropriate LLM client based on provider
         related_works_section: str = self.llm_client.get_completion(prompt)
+        
+        related_works_section = related_works_section.replace("```json","").replace("```","")
+        related_works_section = json_repair.loads(related_works_section)
+        related_work = related_works_section["related_work"]
+        citations = related_works_section["cite_ids"]
 
         filtered_citations: list[str] = filter_citations(
-            related_works_section=related_works_section, citation_strings=[obj["citation"] for obj in relevant_pages]
+            related_works_section=related_work, citation_strings=[obj["citation"] for obj in selected_papers]
         )
 
         if status_callback:
             status_callback(8, f"Generated related work section with {len(filtered_citations)} citations")
 
-        return {"related_works": related_works_section, "citations": filtered_citations, "selected_papers": relevant_pages}
+        return {"related_works": related_work, "cite_ids": citations, "citations": filtered_citations, "selected_papers": selected_papers}
 
     def generate_related_work_from_paper(
         self,

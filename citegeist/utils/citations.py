@@ -197,6 +197,7 @@ def process_arxiv_paper_with_embeddings(arxiv_id: str, topic_model: BERTopic) ->
             pages_text = [pdf[i].get_text() for i in range(len(pdf))]
     finally:
         # Clean up the PDF after processing
+        
         os.remove(pdf_path)
 
     # Step 2: Remove citations and supplementary sections

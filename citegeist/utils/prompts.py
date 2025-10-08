@@ -3,7 +3,7 @@ def process_data_for_extract_cited_sentences(related_work:str) -> str:
     prompt = f"""
             The following is a related work section. Please extract the sentences with citations (e.g. (Mildenhall et al., 2021)) based on the information in the related work.
             For example:
-            The neural radiance field (NeRF) <cite>(Mildenhall et al., 2021)</cite> is one of the advanced methodologies that
+            The neural radiance field (NeRF) (Mildenhall et al., 2021) is one of the advanced methodologies that
             represent scenes using implicit neural rendering with MLP.
 
             Here is the related work:
@@ -11,11 +11,24 @@ def process_data_for_extract_cited_sentences(related_work:str) -> str:
             Please output the whole sentences with citations, not just the citations.
             Please output the result in the following List format:
             [
-                "The neural radiance field (NeRF) <cite>(Mildenhall et al., 2021)</cite> is one of the advanced methodologies that
+                "The neural radiance field (NeRF) (Mildenhall et al., 2021) is one of the advanced methodologies that
                 represent scenes using implicit neural rendering with MLP.",
                 ...
             ]
             """
+    return prompt
+
+def process_data_for_count_citations(related_work:str) -> str:
+    prompt = f"""
+    The following is a related work section. Please count the number of citations in the related work.
+    Here is the related work:
+    {related_work}
+    Please output the number of citations.
+    Please output the result in the following format:
+    {{
+        "number_of_citations": 10
+    }}
+    """
     return prompt
 
 def process_data_for_classify_errors(claim:str,source:str) -> str:
@@ -216,7 +229,7 @@ def process_data_for_related_work_prompt_for_baselines(abstract:str) -> str:
 
 
 
-def genrate_original_related_work_feedback_prompt(
+def generate_original_related_work_feedback_prompt(
     related_work: str,
 ) -> str:
     """
@@ -458,8 +471,15 @@ def generate_related_work_revision_prompt_without_DAG(
     """
     return prompt_section_1 + prompt_section_2
     
-    
-    
+
+def generate_related_work_revise_citations_format(related_work: str) -> str:
+    return f"""
+    Below is the related work section:
+    "{related_work}"
+    Please revise the text by standardizing the citation format to a consistent style, while keeping all academic content, technical terms, and logical structure unchanged.
+    return a pure text output only.
+    """
+
 
 def generate_related_work_revision_prompt(
     source_abstract: str,
@@ -498,7 +518,7 @@ def generate_related_work_revision_prompt(
     - Strengthen criticism: After each type of method, add its shortcomings and relate them to my work.
     - Simplified language: Merge citations, delete redundant descriptions, and highlight the core viewpoints.
     - Clarify comparison: Directly state why my method is better in conclusion. 
-    - Please strictly follow the structure of the related work section.
+    - Please strictly follow the structure of the related work section and make sure accurate attribution based on the given cited info.
     
     Please exclusively respond with the prompt. 
     Do not add any filler text before or after the prompt. 

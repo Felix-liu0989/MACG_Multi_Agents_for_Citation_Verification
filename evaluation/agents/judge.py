@@ -1,13 +1,34 @@
 from collections import defaultdict
 import re
+import sys
+sys.path.append(r"D:\Mydesktop\CitAgent\Code\Supplementary material and code\Multi_Agents_for_Citation_Verification")
+from citegeist.utils.llm_clients.openai_client_op import OpenAIClientOp
 from citegeist.utils.llm_clients.gemini_client import GeminiClient
-from evaluation.agents.prompts import CRITERIA, CRITERIA_BASED_JUDGING_PROMPT, NLI_PROMPT, OUTLINE_EVALUATION_PROMPT, LANGUAGE_EVALUATION_PROMPT, CRITICAL_EVALUATION_PROMPT, get_extraction_prompt, get_citation_extraction_prompt
+from citegeist.utils.llm_clients.deepseek_client import DeepSeekClient
+from evaluation.agents.prompts import (
+    CRITICAL_EVALUATION_PROMPT_Two_Related_Works_Compared_CRITERIA,
+    CRITERIA, 
+    CRITERIA_BASED_JUDGING_PROMPT, 
+    NLI_PROMPT, 
+    OUTLINE_EVALUATION_PROMPT, 
+    LANGUAGE_EVALUATION_PROMPT, 
+    CRITICAL_EVALUATION_PROMPT, 
+    get_extraction_prompt, 
+    get_citation_extraction_prompt, 
+    CRITERIA_BASED_JUDGING_PROMPT_TEXT_QUALITY,
+    CRITERIA_BASED_JUDGING_PROMPT_TEXT_QUALITY_BASELINES
+)
 import os
 import logging
 import json_repair
 import json
-from citegeist.utils.llm_clients.deepseek_client import DeepSeekClient
+from typing import List, Tuple
+import numpy as np
+import threading
 logger = logging.getLogger(__name__)
+
+import dotenv
+dotenv.load_dotenv()
 
 # ====================== Author-Year citation evaluation ======================
 
@@ -17,23 +38,33 @@ class Judge():
         model: str,
     ):
         self.model = model
-        if "gemini" in self.model:
+        if self.model == "google/gemini-2.5-flash":
             self.llm_client = GeminiClient(
                 api_key = os.environ.get("OPENROUTER_API_KEY", ""),
                 model_name = self.model
             )
-        elif "deepseek" in self.model:
+        elif self.model == "deepseek-chat" or self.model == "deepseek-reasoner":
             self.llm_client = DeepSeekClient(
                 api_key = os.environ.get("DEEPSEEK_API_KEY", ""),
                 model_name = self.model
             )
-    def __generate_prompt(self, template, paras):
+        elif  "openai" in self.model:
+            self.llm_client = OpenAIClientOp(
+                api_key = os.getenv("OPENROUTER_API_KEY", ""),
+                model_name = self.model
+            )
+        elif "kimi" in self.model:
+            self.llm_client = OpenAIClientOp(
+                api_key = os.getenv("OPENROUTER_API_KEY", ""),
+                model_name = self.model
+            )
+    def _generate_prompt(self, template, paras):
         prompt = template
         for k in paras.keys():
             prompt = prompt.replace(f"[{k}]", paras[k])
         return prompt
     
-    def get_pair_score_new(self,paper_content:str,claim:str):
+    def _get_pair_score_new(self,paper_content:str,claim:str):
         max_model_len = 900000          
         max_estimate_char_len = int(max_model_len * 1.25)
         if len(paper_content) > max_estimate_char_len:
@@ -41,19 +72,39 @@ class Judge():
             paper_content = paper_content[:max_estimate_char_len]
             
         content_paras = {'SOURCE': paper_content, 'CLAIM': claim}
-        prompt = self.__generate_prompt(NLI_PROMPT, content_paras)
+        prompt = self._generate_prompt(NLI_PROMPT, content_paras)
         messages = [{"role": "user","content": prompt}]
         response = self.llm_client.get_chat_completion(messages)
         return response
-        # try:
-        #     response = self.llm_client.get_chat_completion(messages)
-        # except Exception as e:
-        #     print(f"Error: {e}")
-        #     eval_maxtrix[i][j] = -1
-        #     return eval_maxtrix
-        # if response and  "yes" in response.lower():
-        #     eval_matrix[i][j] = 1
-        # return eval_matrix
+    
+    def extract_num(self, string):
+        numbers = re.findall(r"\d+", string)
+        if len(numbers) == 0:
+            return ""
+        return eval(numbers[0])
+    
+    def __criteria_based_judging(self, abstract, related_work, criterion, res_l, idx):
+        criterion_paras = CRITERIA[criterion]
+        content_paras = {
+            "ABSTRACT": abstract,
+            "RELATED WORK": related_work,
+            "Criterion Description": criterion_paras["description"],
+        }
+        
+        for score in range(1, 6):
+            content_paras[f"Score {score} Description"] = criterion_paras[
+                f"score {score}"
+            ]
+        prompt = self._generate_prompt(CRITERIA_BASED_JUDGING_PROMPT, content_paras)
+        print(f"prompt: {prompt}")
+        messages = [
+            {"role": "user", 
+            "content": prompt},
+        ]
+        scores = self.llm_client.get_chat_completion(messages)
+        print(f"scores: {scores}")
+        res_l[idx] = self.extract_num(scores)
+        return scores
     
     def __get_pair_score(self, paper_content: str, claim: str, pair_scores: list[list[int]], i: int, j: int, citation_idx: int, raw_claim: str):
         max_model_len = 900000          
@@ -63,7 +114,7 @@ class Judge():
             paper_content = paper_content[:max_estimate_char_len]
             
         content_paras = {'SOURCE': paper_content, 'CLAIM': claim}
-        prompt = self.__generate_prompt(NLI_PROMPT, content_paras)
+        prompt = self._generate_prompt(NLI_PROMPT, content_paras)
         messages = [{"role": "user","content": prompt}]
         response = self.llm_client.get_chat_completion(messages)
         return response
@@ -138,6 +189,45 @@ class Judge():
                 content = str(page_texts)
             paper_infos.append({"title": citation, "content": content})
         return key2idx, paper_infos
+    
+
+
+    def _get_quote_improved(self,related_text: str) -> Tuple[List[str], List[str]]:
+        """从 Related-Work 正文中抽取带引用的句子以及去除引用后的声明。"""
+        
+        # 首先按句子分割文本
+        sentences = re.split(r'(?<=[.!?])\s+', related_text.strip())
+        
+        quotes = []
+        claims = []
+        
+        # 改进的引用模式，更精确地匹配引用格式
+        citation_patterns = [
+            r'\([A-Z][A-Za-z]+(?:\s+et\s+al\.?)?\s*,\s*\d{4}[a-z]?\)',  # (Author, 2020)
+            r'\([A-Z][A-Za-z]+(?:\s+(?:and|&)\s+[A-Z][A-Za-z]+)*\s*,\s*\d{4}[a-z]?\)',  # (Author1 and Author2, 2020)
+            r'[A-Z][A-Za-z]+(?:\s+et\s+al\.?)?\s+\(\d{4}[a-z]?\)',  # Author et al. (2020)
+            r'[A-Z][A-Za-z]+(?:\s+(?:and|&)\s+[A-Z][A-Za-z]+)*\s+\(\d{4}[a-z]?\)',  # Author1 and Author2 (2020)
+            r'\((?:[A-Z][A-Za-z]+(?:\s+et\s+al\.?)?\s*,\s*\d{4}[a-z]?(?:\s*;\s*)?)+\)',  # (Yao et al., 2024; Chia et al., 2024;...)
+        ]
+        
+        combined_pattern = '|'.join(f'({pattern})' for pattern in citation_patterns)
+        
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+                
+            # 检查句子是否包含引用
+            if re.search(combined_pattern, sentence):
+                quotes.append(sentence)
+                # 移除所有引用括号内容，保留主要声明
+                claim = re.sub(r'\([^)]*\d{4}[a-z]?[^)]*\)', '', sentence)
+                claim = re.sub(r'[A-Z][A-Za-z]+(?:\s+et\s+al\.?)?\s+(?=\()', '', claim)
+                claim = re.sub(r'\s+', ' ', claim).strip()
+                claims.append(claim)
+        
+        return quotes, claims
+
     
     def _get_quote(self,related_text:str):
         """从 Related-Work 正文中抽取带 (Author, Year) 引用的句子以及映射关系。"""
@@ -298,6 +388,14 @@ class Judge():
                 sources_ids.append(list(ids_here))
         return raw_claims, claims, sources_ids
     
+    def two_related_works_compared_criteria(self, related_work1, related_work2, abstract):
+        prompt = self._generate_prompt(CRITICAL_EVALUATION_PROMPT_Two_Related_Works_Compared_CRITERIA, {"RELATED_WORK1": related_work1, "RELATED_WORK2": related_work2, "ABSTRACT": abstract})
+        messages = [
+            {"role": "user", "content": prompt}
+        ]
+        response = self.llm_client.get_chat_completion(messages)
+        return response
+    
     
     def citation_quality_cite_ids(self, related_json: dict):
         related_works_with_citations = related_json.get("related_works", "")
@@ -349,18 +447,18 @@ class Judge():
     "The systematic exploration of task instruction and input configuration for citation text generation also provides valuable insights into refining attribution quality (Şahinuç et al., 2024)."
 ]
         for idx,raw_claim in enumerate(raw_claims):
-            response = self.get_pair_score_new(cite_info[idx]['paper_content'], raw_claim)
+            response = self._get_pair_score_new(cite_info[idx]['paper_content'], raw_claim)
             cite_info[idx]['score'] = response
         # for idx,cite_item in enumerate(cite_info[:]):
         #     paper_content = cite_item.get('paper_content', '')
         #     raw_claim = cite_item.get('raw_claim', '')
         #     if paper_content == "" or raw_claim == "":
         #         continue
-        #     response = self.__get_pair_score_new(paper_content, raw_claim)
+        #     response = self._get_pair_score_new(paper_content, raw_claim)
         #     cite_item['score'] = response
         with open('/home/liujian/project/2025-07/A2R-code-reproduction/src/evaluation/cite_info.json', 'w') as f:
             json.dump(cite_info, f,indent=4)
-        from evaluation.agents.judge import claim_precision, citation_precision, reference_precision, reference_coverage, citation_density, avg_citation_per_claim, print_result
+        from agents.judge import claim_precision, citation_precision, reference_precision, reference_coverage, citation_density, avg_citation_per_claim, print_result
 
         result = {
             "claim_precision": claim_precision(pair_scores)[0] / claim_precision(pair_scores)[1] if claim_precision(pair_scores)[1] else 0,
@@ -369,11 +467,6 @@ class Judge():
         }
         print_result(result)               
                     
-                        
-        
-        
-        
-                        
 
     def citation_quality_author_year(self, related_json: dict):
         """使用 Judge 实例的 __get_pair_score 评估作者-年份引用格式质量。"""
@@ -408,7 +501,7 @@ class Judge():
                 )
 
         total_paper_num = len(paper_infos)
-        from evaluation.agents.judge import claim_precision, citation_precision, reference_precision, reference_coverage, citation_density, avg_citation_per_claim, print_result
+        from agents.judge import claim_precision, citation_precision, reference_precision, reference_coverage, citation_density, avg_citation_per_claim, print_result
 
         result = {
             "claim_precision": claim_precision(pair_scores)[0] / claim_precision(pair_scores)[1] if claim_precision(pair_scores)[1] else 0,
@@ -420,6 +513,138 @@ class Judge():
         }
         print_result(result)
         return result 
+    
+    def extract_num_addition(self, response: str) -> float:
+        match = re.search(r'<SCORE>\s*(\d+(\.\d+)?)\s*</SCORE>', response)
+        if match:
+            score = float(match.group(1)) 
+            if 0 <= score <= 100:
+                return float(score)
+            else:
+                return 0.0 
+        else:
+            return 0.0  
+    
+    def evaluate_two_related_works_compared(self,related_work1, related_work2, abstract,prompt_template):
+        content_paras = {'RELATED_WORK1': related_work1, 'RELATED_WORK2': related_work2, 'ABSTRACT': abstract}
+        prompt = self._generate_prompt(prompt_template, content_paras)
+        messages = [
+            {"role": "user", "content": prompt}
+        ]
+        response = self.llm_client.get_chat_completion(messages)
+        return response
+        
+    def evaluate_text(self, related_work,prompt_template,abstract):
+        content_paras = {'ABSTRACT': abstract, 'RELATED_WORK': related_work}
+        prompt = self._generate_prompt(prompt_template, content_paras)
+        print(prompt)
+        messages = [
+            {"role": "user", "content": prompt}
+        ]
+        response = self.llm_client.get_chat_completion(messages)
+        return response
+    
+    def evaluate_section(self, section, abstract, prompt_template):
+        content_paras = {'ABSTRACT': abstract, 'SECTION': section}
+        prompt = self._generate_prompt(prompt_template, content_paras)
+        
+        messages = [
+            {"role": "user", 
+            "content": prompt},
+        ]
+        response = self.llm_client.get_chat_completion(messages)
+        
+        score = self.extract_num_addition(response)
+        return score
+    
+    def evaluate_survey_dimension(self, related_work, abstract, dimension_prompt_template):
+        prompt = f"""
+        You are a helpful assistant. Please identify and extract all related work sections from the following text. Do not change any content of the original text, just perform structural processing.
+        If the related work does not start with an explicit section header, please treat the related work as a single section, and do not add any section header.
+        The related work is as follows:
+        {related_work}
+        Please output the structured related work in the following format if there are multiple sections:
+        [
+            "## subsection_1\nGNFL is a graph neural network framework for learning graph representations.\n\n",
+            "## subsection_2\nIts key components include graph convolution..\n\n",
+            ...
+        ]
+        Please output a empty list in the following format if there is only one section:
+      
+        """
+        messages = [
+            {"role": "user", "content": prompt}
+        ]
+        response = self.llm_client.get_chat_completion(
+            messages
+        )
+        sections = response.replace("```json", "").replace("```", "")
+        sections = json_repair.loads(sections)
+        print("--------------------------------")
+        if len(sections) == 0:
+            sections = [related_work]
+        section_scores = []
+        thread_l = []
+        
+        score_results = [None] * len(sections)
+
+        def evaluate_section_thread(i, section):
+            score = self.evaluate_section(section.strip(), abstract, dimension_prompt_template)
+            score_results[i] = score 
+
+        for i, section in enumerate(sections):
+            
+            thread = threading.Thread(target=evaluate_section_thread, args=(i, section))
+            thread_l.append(thread)
+            thread.start()
+        
+        for thread in thread_l:
+            thread.join()
+
+        section_scores = [score for score in score_results if score is not None]
+
+        if section_scores:
+            print(section_scores, flush=True)
+
+            filtered_scores = [score for score in section_scores if score != 0]
+            avg_score = np.mean(filtered_scores) if filtered_scores else 0.0
+            print(avg_score, flush=True)
+
+        else:
+            avg_score = 0.0
+
+        return avg_score
+    def evaluate_two_related_works_compared_criteria(self,related_work1, related_work2, abstract,CRITICAL_EVALUATION_PROMPT_Two_Related_Works_Compared_CRITERIA):
+        return self.evaluate_two_related_works_compared_criteria(related_work1, related_work2, abstract, CRITICAL_EVALUATION_PROMPT_Two_Related_Works_Compared_CRITERIA)
+    def evaluate_text_quality(self, related_work,abstract):
+        return self.evaluate_text(related_work,CRITERIA_BASED_JUDGING_PROMPT_TEXT_QUALITY,abstract)
+    def evaluate_text_quality_baselines(self, related_work,abstract):
+        return self.evaluate_text(related_work,CRITERIA_BASED_JUDGING_PROMPT_TEXT_QUALITY_BASELINES,abstract)
+    def evaluate_language(self, related_work, abstract):
+        return self.evaluate_survey_dimension(related_work, abstract, LANGUAGE_EVALUATION_PROMPT)
+
+    def evaluate_critical(self, related_work, abstract):
+        return self.evaluate_survey_dimension(related_work, abstract, CRITICAL_EVALUATION_PROMPT)
+    
+    def evaluate_all_dimensions(self, related_work, abstract):
+        language_score = self.evaluate_language(related_work, abstract)
+        critical_score = self.evaluate_critical(related_work, abstract)
+        return language_score, critical_score
+
+    
+    def batch_criteria_based_judging(self, related_work, abstract, criteria):
+        thread_l = []
+        scores = [0] * len(criteria)
+        for i in range(len(criteria)):
+            thread = threading.Thread(
+                target=self.__criteria_based_judging,
+                args=(abstract, related_work, criteria[i], scores, i),
+            )
+            thread_l.append(thread)
+            thread.start()
+        for thread in thread_l:
+            thread.join()
+        return scores
 
 # ===================== 评估指标函数 =====================
 

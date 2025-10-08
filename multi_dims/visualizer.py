@@ -289,6 +289,7 @@ class DAGVisualizer:
         Args:
             output_dir: 输出目录
         """
+        topic = topic.replace(":", "_").replace(" ", "_")
         os.makedirs(os.path.join(output_dir, topic), exist_ok=True)
         arxiv_trees = ""
         for dimension in self.dimensions:
